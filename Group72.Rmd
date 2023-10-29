@@ -1,0 +1,780 @@
+---
+title: "H&M Customer Value"
+author: "Group 72"
+output: 
+  html_document:
+  toc: true
+  toc_float: true
+  theme: lumen
+---
+
+# Setup - Packages & Data Import
+
+## Load Packages
+
+```{r setup, echo = FALSE}
+library(tidyverse)
+library(dplyr)
+library(lubridate)
+library(digest)
+library(zoo)
+library(Metrics)
+library(caret)
+
+## this makes it so we can run more memory-intensive calculations on Mac
+# library(usethis) 
+# usethis::edit_r_environ()
+
+```
+
+## Import Data
+
+```{r data ingestion, message = FALSE}
+# H&M DATA
+transaction_data <- read_csv("transactions_train.csv")
+article_data <- read_csv("articles.csv")
+customer_data <- read_csv("customers.csv")
+
+# IRS DATA
+irs_data <- read_csv("20zpallagi.csv")
+# grab just zip
+zip_data <- irs_data[,2:3] %>% unique()
+```
+
+# Exploratory Data Analysis
+
+### Attempt to Join IRS to H&M by hashed ZIP code
+
+```{r irs join}
+# see if we can join IRS data to HMI customer data (H&M ZIPs are hashed)
+zip_data <- zip_data %>% 
+  rowwise() %>% 
+  mutate(MD5 = digest(zipcode, algo = "md5", serialize = F),
+         SHA1 = digest(zipcode, algo = "sha1", serialize = F),
+         CRC32 = digest(zipcode, algo = "crc32", serialize = F),
+         SHA256 = digest(zipcode, algo = "sha256", serialize = F),
+         SHA512 = digest(zipcode, algo = "sha512", serialize = F),
+         BLAKE3 = digest(zipcode, algo = "blake3", serialize = F),
+         XXHASH32 = digest(zipcode, algo = "xxhash32", serialize = F),
+         XXHASH64 = digest(zipcode, algo = "xxhash64", serialize = F),
+         MURMUR32 = digest(zipcode, algo = "murmur32", serialize = F),
+         SPOOKYHASH = digest(zipcode, algo = "spookyhash", serialize = T)) %>% 
+  gather(key = "algo", value = "hashed_zip", -c(STATE,zipcode))
+
+# unfortunately, we can't :(
+zip_joined <- customer_data %>% 
+  left_join(zip_data, by = c("postal_code" = "hashed_zip"))
+
+rm(irs_data, zip_data, zip_joined)
+```
+
+## Summaries & Plots
+
+```{r}
+# join customer and article info to transaction data (mult steps for memory reasons)
+hm_data <- transaction_data %>% 
+  left_join(customer_data, by = "customer_id")
+#rm(transaction_data) 
+hm_data <- hm_data %>% 
+  left_join(article_data, by = "article_id")
+#rm(article_data)
+
+# DATA EXPLORATION
+summary(hm_data)
+
+# plot of customer age
+hist(customer_data$age, main = "Customer Age Distribution", 
+     xlab = "Customer Age")
+
+rm(customer_data)
+
+# avg purchase volume by age
+hm_data %>% 
+  group_by(customer_id, age) %>% 
+  summarize(transactions = n()) %>% 
+  ungroup() %>% 
+  group_by(age) %>% 
+  summarize(avg_t = mean(transactions)) %>% 
+  ungroup() %>% 
+  plot(main = "Average Purchase Volume by Customer Age", 
+       xlab = "Customer Age", "Avg. Purchase Volume")
+
+# avg spend per item by age
+hm_data %>% 
+  group_by(customer_id, age) %>% 
+  summarize(spend_masked = sum(price, na.rm = T)/n()) %>% 
+  ungroup() %>% 
+  group_by(age) %>% 
+  summarize(avg_spend_masked = mean(spend_masked)) %>% 
+  ungroup() %>% 
+  plot(main = "Average Spend per Item by Customer Age",
+       sub = "Item prices are masked but can be compared directionally.",
+       xlab = "Customer Age", "Avg. Spend per Item")
+
+
+# get unique combinations of newsletter-related columns (with counts) to see if they are duplicative
+newsletter_club_info <- hm_data %>% 
+  group_by(FN, Active, club_member_status, fashion_news_frequency) %>% 
+  summarize(count = n()) %>% 
+  ungroup()
+
+# customers subscribed or not subscribed to fashion newsletter
+yes_fn <- customer_data %>% filter(!is.na(FN)) %>% select(customer_id)
+no_fn <- customer_data %>% filter(is.na(FN)) %>% select(customer_id)
+
+# transactions for newsletter/no newsletter
+fn_transact <- hm_data %>% filter(customer_id %in% yes_fn)
+no_fn_transact <- hm_data %>% filter(customer_id %in% no_fn)
+
+# number of purchases
+nrow(fn_transact) / nrow(yes_fn)
+nrow(no_fn_transact) / nrow(no_fn)
+
+rm(yes_fn, no_fn, fn_transact, no_fn_transact)
+
+customer_data %>% pull(age) %>% median(na.rm = TRUE)
+
+customer_freq <- hm_data %>% 
+  group_by(customer_id) %>% 
+  summarize(count = n()) %>% 
+  ungroup()
+
+customer_freq$count[customer_freq$count >= 100 ] <- 100
+
+hist(customer_freq$count,
+     breaks = 11,
+     main = "Customer Purchase Frequncy",
+     xlab = "# of Purchases",
+     sub = "Purchases > 100 are grouped into largest bucket.")
+
+ggplot(customer_freq, aes(x = count)) + geom_histogram(bins = 11) +
+  labs(title="Transaction Volume Distribution", x="Transactions", y="Count") +
+  scale_x_discrete(breaks = waiver(), 
+                   labels = c("1-9", "10-19", "20-29", "30-39", "40-49",
+                              "50-59", "60-69", "70-79", "80-89", "90-99", "100+")) + 
+  scale_y_continuous()
+
+
+# volume trend
+trend_data <- hm_data %>% 
+  mutate(Purchase_Channel = case_when(sales_channel_id == 1 ~ "In Store",
+                                      sales_channel_id == 2 ~ "Online",
+                                      TRUE ~ "Unknown"),
+         YearMon = as.yearmon(t_dat)
+         ) %>% 
+  group_by(YearMon, Purchase_Channel) %>% 
+  summarize(Transactions = n()) %>% 
+  ungroup()
+
+trend_data %>%
+  ggplot(aes(x = YearMon, y = Transactions/1000000, fill = Purchase_Channel)) + 
+  geom_bar(position="stack", stat="identity") +
+  ggtitle("Transaction Volume by Purchase Channel") + 
+  ylab("Transactions (Millions)") + 
+  theme(legend.position = "top") +
+  scale_fill_discrete(name = "Purchase Channel")
+
+# what percent of customers missing age?
+customer_data %>% filter(is.na(age)) %>% nrow() / nrow(customer_data)
+```
+
+
+# Data Preparation
+
+## Data Prep for Linear & Logistic Regression
+
+```{r}
+#Total number of transaction records 31788324
+#Filter transactions for the date range from Sep 2018 till Feb 2019 for Analysis
+subset_1 <- subset(transaction_data, t_dat >= "2018-09-20" & t_dat <= "2019-02-28")
+summary(subset_1)
+#Filter transactions for the date range from Sep 2019 till Feb 2020 for Analysis
+subset_2 <- subset(transaction_data, t_dat >= "2019-09-01" & t_dat <= "2020-02-29")
+summary(subset_2)
+#Sum and count the transactions per customer from Sep 2018 till Feb 2019
+summarized_data_1 <- subset_1 %>%
+  group_by(customer_id) %>%
+  summarize(initial_price = sum(price), initial_count = n())
+#Sum and count the transactions per customer from Sep 2019 till Feb 2020
+summarized_data_2 <- subset_2 %>%
+  group_by(customer_id) %>%
+  summarize(final_price = sum(price), final_count = n())
+#Merge the 2 summarized data frames and include all the rows 
+merged_df <- merge(summarized_data_1, summarized_data_2, by = "customer_id", all = TRUE)
+#Replace all null values with 0
+merged_df <- replace(merged_df, is.na(merged_df), 0)
+summary(merged_df)
+#Merge customer data frame with transaction merge data frame
+master_df <- merge(customer_data, merged_df, by = "customer_id", all = FALSE)
+summary(master_df)
+#Total number of records in the merged data frame 1006583
+#remove rows where age is NA
+master_df <- master_df[!is.na(master_df$age),]
+summary(master_df)
+#Total number of records after removing age with NA is 994765
+#replace NA values with 0 for FN and Active
+master_df$FN[is.na(master_df$FN)] <- 0
+master_df$Active[is.na(master_df$Active)] <- 0
+summary(master_df)
+#Remove Outlier in age, initial price and final price using IQR method
+master_clean <- master_df %>%
+  filter(age > quantile(age, 0.25) - 1.5*IQR(age) &
+           age < quantile(age, 0.75) + 1.5*IQR(age) &
+           initial_price < quantile(initial_price, 0.75) + 1.5*IQR(initial_price) &
+           final_price < quantile(final_price, 0.75) + 1.5*IQR(final_price))
+summary(master_clean)
+#Total number of records after removing the outliers is 863086
+#Club Member Status unique values
+unique(master_df$club_member_status)
+#fashion_news_frequency unique values
+unique(master_df$fashion_news_frequency)
+#We will create indicator variables with the club_member_status
+# and fashion_news_frequency
+master_clean<- master_clean %>%
+  mutate(CM_ACTIVE = ifelse(club_member_status=="ACTIVE",1,0)) %>%
+  mutate(CM_CREATE = ifelse(club_member_status=="PRE-CREATE",1,0)) %>%
+  mutate(CM_LEFT = ifelse(club_member_status=="LEFT CLUB",1,0)) %>%
+  mutate(NL_REG = ifelse(fashion_news_frequency=="Regularly",1,0)) %>%
+  mutate(NL_MONTHLY = ifelse(fashion_news_frequency=="Monthly",1,0))
+summary(master_clean)
+#Remove all previously created data frame for freeing memory
+rm(customer_data)
+rm(transaction_data)
+rm(subset_1)
+rm(subset_2)
+rm(summarized_data_1)
+rm(summarized_data_2)
+rm(merged_df)
+rm(master_df)
+# Find the count of unique values in the 'postal_code' column
+unique_count <- length(unique(master_clean$postal_code))
+print(unique_count)
+#As there are 303499 unique postal code out of 863086 records
+#so will drop the postal code column for further analysis
+#Drop the postal_code column
+master_clean$postal_code <- NULL
+# Randomly select 25% of the data for the analysis, as
+#the entire data is getting a space error
+master_sample <- master_clean %>% sample_frac(0.25)
+summary(master_sample)
+#Number of records in sample data frame is 215772
+#Adding polynomial values of age and initial price to master sample
+master_sample <- master_sample %>%
+  mutate(Sq_i_price = initial_price*initial_price) %>%
+  mutate(Sq_age = age*age) %>%
+  mutate(cube_age = age*age*age) %>%
+  mutate(age_price = age*initial_price)
+summary(master_sample)
+```
+
+
+## Data Prep for Linear Models (w/ transaction, customer, and article data)
+
+```{r}
+set.seed(57)
+
+transaction_data <- transaction_data %>% ungroup()
+
+data_split <- ungroup(transaction_data) %>%
+  nest_by(customer_id) %>%
+  ungroup() %>% 
+  mutate(tt = floor(.7*n()),
+     tt = sample(rep(c('train', 'test'), c(tt[1], n()-tt[1])))) %>%
+  unnest(data) %>%
+  group_split(tt, .keep = FALSE)
+
+# will still be random since IDs are hashed
+data_test <- data_split[[1]] %>% arrange(customer_id) %>% slice_head(n = 900000)
+data_train <- data_split[[2]] %>% arrange(customer_id) %>% slice_head(n = 2100000)
+
+
+# data_train <- transaction_data %>%
+#   arrange(customer_id) %>%
+#   slice_head(n = 500000) 
+# %>%
+#   left_join(article_data, by = "article_id")
+
+
+# function to calcualte mode
+mode_fun <- function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+# divide into "pre" & post periods
+customer_transactions_pre <- data_train %>% 
+  ungroup() %>% 
+  left_join(article_data, by = "article_id") %>%
+  filter(t_dat >= "2018-09-20" & t_dat <= "2019-02-28") 
+
+customer_transactions_pre <- customer_transactions_pre %>% 
+  group_by(customer_id) %>% 
+  summarize(purch_total_pre = sum(price, na.rm = T),
+            num_purch = n(),
+            days_purch = n_distinct(t_dat),
+            min_purch_dt = min(t_dat),
+            max_purch_dt = max(t_dat),
+            time_between_purch = max_purch_dt - min_purch_dt,
+            time_since_last_purch = Sys.Date() - max_purch_dt,
+            dept_max = mode_fun(index_code),
+            cat_max = as.factor(mode_fun(index_group_no)),
+            online_pct = (sum(sales_channel_id == 2)/n())
+            ) %>% 
+  ungroup() 
+
+customer_transactions_pre <- customer_transactions_pre %>% 
+  left_join(customer_data, by = "customer_id")  
+ #mutate(newsletter = case_when)
+  # we can filter out where age is missing because it is a very small % of the data
+
+customer_transactions_pre <- customer_transactions_pre %>%
+  filter(!is.na(age)) 
+
+customer_transactions_pre <- customer_transactions_pre %>%
+  # ADD VARS FOR JUST TWO OPTIONS
+  mutate(fn_none = case_when(fashion_news_frequency == "NONE" | fashion_news_frequency == "None" ~ 1,
+                             TRUE ~ 0),
+         fn_monthly = case_when(fashion_news_frequency == "Monthly" ~ 1,
+                                TRUE ~ 0),
+         fn_regularly = case_when(fashion_news_frequency == "Regularly" ~ 1,
+                                  TRUE ~ 0),
+         club_none = case_when(club_member_status == "NONE" ~ 1,
+                               TRUE ~ 0),
+         club_pre = case_when(club_member_status == "PRE-CREATE" ~ 1,
+                              TRUE ~ 0),
+         club_active = case_when(club_member_status == "ACTIVE" ~ 1,
+                                 TRUE ~ 0),
+         club_left = case_when(club_member_status == "LEFT CLUB" ~ 1,
+                               TRUE ~ 0))
+
+
+customer_value_post <- data_train %>% 
+  filter(t_dat >= "2019-09-01" & t_dat <= "2020-02-29") %>% 
+  group_by(customer_id) %>% 
+  summarize(purch_total_post = sum(price, na.rm = T)) %>% 
+  ungroup() 
+
+# join "post" period spend to "pre" period data - "post" period spend will be our dependent variable
+customer_transactions <- customer_transactions_pre %>% 
+  left_join(customer_value_post, by = "customer_id") %>% 
+  mutate(purch_total_post = str_replace_na(purch_total_post, replacement = 0),
+         purch_total_post = as.numeric(purch_total_post))
+
+# rm(transaction_data)
+# rm(article_data)
+
+
+customer_transactions_pre_test <- data_test %>% 
+  left_join(article_data, by = "article_id") %>%
+  filter(t_dat >= "2018-09-20" & t_dat <= "2019-02-28") 
+
+customer_transactions_pre_test <- customer_transactions_pre_test %>% 
+  group_by(customer_id) %>% 
+  summarize(purch_total_pre = sum(price, na.rm = T),
+            num_purch = n(),
+            days_purch = n_distinct(t_dat),
+            min_purch_dt = min(t_dat),
+            max_purch_dt = max(t_dat),
+            time_between_purch = max_purch_dt - min_purch_dt,
+            time_since_last_purch = Sys.Date() - max_purch_dt,
+            dept_max = mode_fun(index_code),
+            cat_max = as.factor(mode_fun(index_group_no)),
+            online_pct = (sum(sales_channel_id == 2)/n())
+            ) %>% 
+  ungroup() 
+
+customer_transactions_pre_test <- customer_transactions_pre_test %>% 
+  left_join(customer_data, by = "customer_id")  
+ #mutate(newsletter = case_when)
+  # we can filter out where age is missing because it is a very small % of the data
+
+customer_transactions_pre_test <- customer_transactions_pre_test %>%
+  filter(!is.na(age)) 
+
+customer_transactions_pre_test <- customer_transactions_pre_test %>%
+  # ADD VARS FOR JUST TWO OPTIONS
+  mutate(fn_none = case_when(fashion_news_frequency == "NONE" | fashion_news_frequency == "None" ~ 1,
+                             TRUE ~ 0),
+         fn_monthly = case_when(fashion_news_frequency == "Monthly" ~ 1,
+                                TRUE ~ 0),
+         fn_regularly = case_when(fashion_news_frequency == "Regularly" ~ 1,
+                                  TRUE ~ 0),
+         club_none = case_when(club_member_status == "NONE" ~ 1,
+                               TRUE ~ 0),
+         club_pre = case_when(club_member_status == "PRE-CREATE" ~ 1,
+                              TRUE ~ 0),
+         club_active = case_when(club_member_status == "ACTIVE" ~ 1,
+                                 TRUE ~ 0),
+         club_left = case_when(club_member_status == "LEFT CLUB" ~ 1,
+                               TRUE ~ 0))
+
+
+customer_value_post_test <- data_test %>% 
+  filter(t_dat >= "2019-09-01" & t_dat <= "2020-02-29") %>% 
+  group_by(customer_id) %>% 
+  summarize(purch_total_post = sum(price, na.rm = T)) %>% 
+  ungroup() 
+
+# join "post" period spend to "pre" period data - "post" period spend will be our dependent variable
+customer_transactions_test <- customer_transactions_pre_test %>% 
+  left_join(customer_value_post, by = "customer_id") %>% 
+  mutate(purch_total_post = str_replace_na(purch_total_post, replacement = 0),
+         purch_total_post = as.numeric(purch_total_post))
+
+```
+
+
+# Modeling
+
+## Linear Regression (transaction & customer data)
+
+```{r}
+#Number of records in sample data frame is 215772
+# Dividing data into training, testing and validation
+set.seed(123)
+trainIndex <- createDataPartition(master_sample$final_price, p = 0.6, list = FALSE)
+testIndex <- createDataPartition(master_sample$final_price[-trainIndex], p = 0.5, list = FALSE)
+train <- master_sample[trainIndex,]
+test <- master_sample[-trainIndex,][testIndex,]
+validation <- master_sample[-c(trainIndex, testIndex),]
+#Create Linear Regression Model
+hm_lm_1 <- lm(final_price ~ initial_price + initial_count + age + FN + 
+                Active + CM_ACTIVE + CM_CREATE + CM_LEFT + NL_REG + 
+                NL_MONTHLY, data=train)
+summary(hm_lm_1)
+#hm_lm_1 R-squared:  0.03824,	Adjusted R-squared:  0.03817
+#create second linear regression model with highest 
+# 5 statiscally significant co-efficient
+hm_lm_2 <- lm(final_price ~ FN + Active + CM_ACTIVE + CM_LEFT +
+                NL_MONTHLY, data = train)
+summary(hm_lm_2)
+#hm_lm_2 R-squared:  0.01786,	Adjusted R-squared:  0.01783
+#Create a model with significant codes as 0 from model 1
+hm_lm_3 <- lm(final_price ~ initial_price + age + FN + Active + CM_ACTIVE +
+                CM_LEFT + NL_MONTHLY, data=train)
+summary(hm_lm_3)
+#hm_lm_3 R-squared:  0.03807,	Adjusted R-squared:  0.03802
+#Create a model with squared values of age and initial price
+hm_lm_4 <- lm(final_price ~ Sq_i_price + Sq_age + FN + Active + CM_ACTIVE +
+                CM_LEFT + NL_MONTHLY, data=train)
+summary(hm_lm_4)
+#hm_lm_4 R-squared:  0.05005,	Adjusted R-squared:   0.05
+#Create a model with cube of age and squared initial price
+hm_lm_5 <- lm(final_price ~ Sq_i_price + cube_age + FN + Active + CM_ACTIVE +
+                CM_LEFT + NL_MONTHLY, data=train)
+summary(hm_lm_5)
+#hm_lm_5 R-squared:  0.05009,	Adjusted R-squared:  0.05004
+#Create a model with all the sig variables from model 1, replacing age by
+# cube value of age, price by square value of price and the product of
+#price and age
+hm_lm_6 <- lm(final_price ~ Sq_i_price + cube_age + FN + 
+                Active + CM_ACTIVE + NL_MONTHLY + age_price, data=train)
+summary(hm_lm_6)
+#hm_lm_6 R-squared:  0.05083,	Adjusted R-squared:  0.05078
+#As the cube of age variable is relative less significant
+#will run the model with age only
+hm_lm_7 <- lm(final_price ~ Sq_i_price + age + FN + 
+                Active + CM_ACTIVE + NL_MONTHLY + age_price, data=train)
+summary(hm_lm_7)
+#hm_lm_7 R-squared:  0.05099,	Adjusted R-squared:  0.05094
+#Based on the Adjusted R-squared values models hm_lm_5, hm_lm_6 
+# and hm_lm_7 will be used on the test data frames
+prediction5 <- predict(hm_lm_5, newdata = test)
+prediction6 <- predict(hm_lm_6, newdata = test)
+prediction7 <- predict(hm_lm_7, newdata = test)
+#Calculate mse, rmse, mae,and mape
+install.packages("Metrics")
+library(Metrics)
+# Calculate evaluation metrics using Metrics for model 5
+mse <- mse(prediction5, test$final_price)
+rmse <- rmse(prediction5, test$final_price)
+mae <- mae(prediction5, test$final_price)
+mape <- mape(prediction5, test$final_price)
+# Print the results
+print(paste("MSE:", mse))
+print(paste("RMSE:", rmse))
+print(paste("MAE:", mae))
+print(paste("MAPE:", mape))
+#Result model 5 
+#"MSE: 0.0178410273786287"
+#"RMSE: 0.133570308746475"
+#"MAE: 0.103100220034974"
+#"MAPE: 0.959301806146701"
+# Calculate evaluation metrics using Metrics for model 6
+mse <- mse(prediction6, test$final_price)
+rmse <- rmse(prediction6, test$final_price)
+mae <- mae(prediction6, test$final_price)
+mape <- mape(prediction6, test$final_price)
+# Print the results
+print(paste("MSE:", mse))
+print(paste("RMSE:", rmse))
+print(paste("MAE:", mae))
+print(paste("MAPE:", mape))
+#Result model 6 
+#"MSE: 0.017808192166407"
+#"RMSE: 0.133447338551232"
+#"MAE: 0.102853668202384"
+#"MAPE: 0.955760619018469"
+# Calculate evaluation metrics using Metrics for model 7
+mse <- mse(prediction7, test$final_price)
+rmse <- rmse(prediction7, test$final_price)
+mae <- mae(prediction7, test$final_price)
+mape <- mape(prediction7, test$final_price)
+# Print the results
+print(paste("MSE:", mse))
+print(paste("RMSE:", rmse))
+print(paste("MAE:", mae))
+print(paste("MAPE:", mape))
+#Result model 7 
+#"MSE: 0.0178063229475723"
+#"RMSE: 0.133440334785148"
+#"MAE: 0.102839314579176"
+#"MAPE: 0.955568207728647"
+#Based on the predictions, Model 7 is having the lowest
+#MSE, RMSE, MAE and MAPE and is the best model so far.
+# Load the randomForest package
+library(randomForest)
+# Build the random forest model with the initial field values
+rf_model <- randomForest(final_price ~ initial_price + initial_count + age + FN +
+                           Active + CM_ACTIVE + CM_CREATE + CM_LEFT + NL_REG +
+                           NL_MONTHLY, data = train, ntree = 500, 
+                         mtry = 3, importance = TRUE)
+summary(rf_model)
+# Make predictions on the test set
+rf_predictions <- predict(rf_model, newdata = test)
+# Calculate evaluation metrics using Metrics for Rain forest
+mse <- mse(rf_predictions, test$final_price)
+rmse <- rmse(rf_predictions, test$final_price)
+mae <- mae(rf_predictions, test$final_price)
+mape <- mape(rf_predictions, test$final_price)
+# Print the results
+print(paste("MSE:", mse))
+print(paste("RMSE:", rmse))
+print(paste("MAE:", mae))
+print(paste("MAPE:", mape))
+#Result Rain forest model 
+#"MSE: 0.0166457596576039"
+#"RMSE: 0.129018446966331"
+#"MAE: 0.0978164291973167"
+#"MAPE: 0.969641133775231"
+#Based on the evaluation metrics rf_model is better than hm_lm_7 due to the 
+#the following reasons:
+#1) MSE (Mean Squared Error) of rf_model has a lower value (0.0166) 
+#compared to hm_lm_7 (0.0178), which suggests that rf_model has a 
+#better overall fit to the data.
+#2) RMSE (Root Mean Squared Error) of rf_model has a lower value (0.129) 
+#compared to hm_lm_7 (0.133), which means that rf_model has a smaller 
+#average error in its predictions compared to hm_lm_7 
+#3) MAE (Mean Absolute Error) of rf_model has a lower value (0.0978) compared 
+#to hm_lm_7 (0.1028), which indicates that rf_model has a better accuracy
+#4) MAPE (Mean Absolute Percentage Error) of hm_lm_7 has a lower value (0.956)
+#compared to rf_model (0.970), but it's important to note that MAPE
+# is a relative measure of error that depends on the scale of the data
+# and may not be directly comparable between models
+###Validate Rain Forest regression model as it is having the best accuracy
+rf_validate <- predict(rf_model, newdata = validation)
+# Calculate evaluation metrics using Metrics for Rain forest
+mse <- mse(rf_validate, validation$final_price)
+rmse <- rmse(rf_validate, validation$final_price)
+mae <- mae(rf_validate, validation$final_price)
+mape <- mape(rf_validate, validation$final_price)
+# Print the results
+print(paste("MSE:", mse))
+print(paste("RMSE:", rmse))
+print(paste("MAE:", mae))
+print(paste("MAPE:", mape))
+#Result of Rain forest model on the validation data
+#"MSE: 0.0166903329058916"
+#"RMSE: 0.129191071308708"
+#"MAE: 0.0978749335418699"
+#"MAPE: 0.965945239641455" 
+
+```
+
+## Linear Regression (transaction, customer, and article data)
+
+```{r}
+model_A <- lm(purch_total_post ~ purch_total_pre + num_purch + days_purch + time_between_purch + time_since_last_purch + age + dept_max, 
+              data = customer_transactions)
+summary(model_A)
+
+model_B <- lm(purch_total_post ~ purch_total_pre + num_purch + days_purch + time_between_purch + time_since_last_purch + age + dept_max + online_pct, 
+              data = customer_transactions)
+summary(model_B)
+
+model_C <- lm(purch_total_post ~ purch_total_pre + num_purch + 
+              days_purch + time_between_purch + time_since_last_purch + age + dept_max + online_pct + 
+              fn_none + fn_monthly + fn_regularly + club_none + club_pre + club_active + club_left, 
+              data = customer_transactions)
+summary(model_C)
+
+model_D <- lm(purch_total_post ~ purch_total_pre + num_purch + 
+              days_purch + time_between_purch + time_since_last_purch + age + cat_max + online_pct + 
+              fn_none + fn_monthly + fn_regularly + club_none + club_pre + club_active + club_left, 
+              data = customer_transactions)
+summary(model_D)
+
+
+#  stepwise regression to select factors
+data_for_model <- customer_transactions %>% 
+  select(purch_total_pre,
+         num_purch,
+         days_purch,
+         time_between_purch,
+         time_since_last_purch,
+         age,
+         cat_max,
+         dept_max,
+         online_pct,
+         fn_none,
+         fn_monthly,
+         fn_regularly,
+         club_none,
+         club_pre,
+         club_active,
+         club_left,
+         purch_total_post)
+
+step_model <- lm(purch_total_post~., data = data_for_model)
+
+step(step_model, 
+     scope = list(lower = formula(lm(purch_total_post ~ 1, data = data_for_model)),
+                  upper = formula(lm(purch_total_post~., data = data_for_model))),
+     direction = "both")
+
+# run the model selected above to look at further detail
+selected_step_model <- lm(formula = purch_total_post ~ purch_total_pre + days_purch + time_since_last_purch + age + dept_max + online_pct + fn_regularly + club_active, 
+    data = data_for_model)
+
+summary(selected_step_model)
+
+
+predictions <- predict(selected_step_model, newdata = customer_transactions_test)
+
+# Calculate evaluation metrics using Metrics for model 5
+mse_step <- mse(predictions, data_for_model$purch_total_post)
+rmse_step <- rmse(predictions, data_for_model$purch_total_post)
+mae_step <- mae(predictions, data_for_model$purch_total_post)
+mape_step <- mape(predictions, data_for_model$purch_total_post)
+# Print the results
+print(paste("MSE:", round(mse_step, 2)))
+print(paste("RMSE:", round(rmse_step, 2)))
+print(paste("MAE:", round(mae_step, 2)))
+print(paste("MAPE:", round(mape_step, 2)))
+
+
+```
+
+## Logistic Regression
+
+```{r logistic regression}
+
+#to explore creating a logistic regression, let's look at the data
+#we'd like to be able to predict
+summary(master_clean$final_price)
+summary(master_clean$final_count)
+
+#top quartile of spenders are final price > 0.16941 and/or final count > 6
+#we will use the count number instead of price for interpretability purposes 
+#(since price is clearly masked to obscure its true value in this dataset) to 
+#define our threshold for "loyal" customers.
+
+log_input_data <- master_clean %>%
+  mutate(Loyal = ifelse(final_count >= 6, 1, 0))
+
+logmodel1 <- glm(Loyal ~ age + FN + 
+                   Active + CM_ACTIVE + CM_CREATE + CM_LEFT + NL_REG + 
+                   NL_MONTHLY + initial_price + initial_count, 
+                 data = log_input_data, family = "binomial")
+
+summary(logmodel1)
+#from summary we see that all variables except CM_CREATE are significant
+#at 95% CI. Let's remove CM_CREATE
+
+logmodel2 <- glm(Loyal ~ age + FN + 
+                   Active + CM_ACTIVE + CM_LEFT + NL_REG + 
+                   NL_MONTHLY + initial_price + initial_count,
+                 data = log_input_data, family = "binomial")
+
+summary(logmodel2)
+#all variables significant. Now let's look at the predictions
+
+logpredictions <- round(fitted.values(logmodel2),0)
+
+#merge predictions with the input data in a new dataframe
+log_output_data <- cbind(log_input_data, logpredictions)
+
+#create confusion matrix to see how accurate our predictions are at
+#predicting "loyal" (high spending) customers
+
+library(caret)
+
+confusion<-confusionMatrix(data=as.factor(log_output_data$logpredictions),
+                           reference=as.factor(log_output_data$Loyal),positive='1')
+
+#print/plot the resulting confusion matrix output
+print(confusion)
+
+#because our confusion matrix has an accuracy of ~73%, we can say that
+#our logistic regression model does a good job of predicting loyal customers
+#(defined as those who are in the top quartile of purchasers)
+#based on current purchase history, age, subscription to newletters, and
+#club member status
+
+#the specificity is 98.5%, which is extremely impressive. This means, when
+#a customer is not loyal, our model correctly predicts this 98.5% of the time.
+#the sensitivity is, however, poor at 5.6%. When a customer is loyal,
+#our model is likely to incorrectly categorize them as not loyal. 
+#To fix this, let's adjust our cutoff value for "loyal"
+
+predictions2 <- fitted.values(logmodel2)
+
+predictions2 <- ifelse(predictions2 > .3, 1, 0)
+
+head(predictions2)
+
+log_output_data <- cbind(log_output_data, predictions2)
+
+confusion2 <-confusionMatrix(data=as.factor(log_output_data$predictions2),
+                             reference=as.factor(log_output_data$Loyal),positive='1')
+
+print(confusion2)
+#this is worse accuracy at 66%, and worse specificity (75%)
+#despite better sensitivity (42%). From here, let's see if
+#there could be a better threshold (other than .5 and .3) to choose
+
+#let's look at an ROC curve now 
+library(ROCR)
+
+# Create a prediction object 
+pred <- prediction(as.numeric(fitted.values(logmodel2)),
+                   as.numeric(log_output_data$Loyal))
+
+# Use the performance function to solve and plot the roc curve
+roc <- performance(pred,"tpr", "fpr")
+sensspec <- performance(pred,"sens", "spec")
+
+# plot the ROC curve
+plot(roc,main="ROC curve for GLM model")
+plot(sensspec)
+
+alphas <- unlist(sensspec@alpha.values)
+spec <- unlist(sensspec@x.values)
+sens <- unlist(sensspec@y.values)
+
+which(round(sens,2) == .65)
+#260971 index returns sensitivity of 65%
+
+spec[260971]
+#the specificity here is only 48%
+alphas[260971]
+#threshold to use to achieve 65% sensitivity and 48% specificity
+#would be .25 here - not much different than our .3 above.
+#we won't try this as <50% specificity is not ideal, and our initial
+#model above had such a good specificity.
+```
+
+
+
+
+
